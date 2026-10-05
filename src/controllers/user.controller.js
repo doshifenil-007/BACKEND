@@ -3,6 +3,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
 import { User } from "../models/user.models.js";
 import jwt from "jsonwebtoken"
+import mongoose from "mongoose"
 import { uploadOnCloudinary } from "../utils/cloudinary.js"
 import { ApiResponse } from "../utils/ApiResponse.js";
 
@@ -117,23 +118,25 @@ const loginUser = asyncHandler(async (req, res) => {
     //access token and refresh token
     //send cookie
 
-    const { email, username, password } = req.body
+    const { email, username, password } = req.body || {}
 
-    if (!email || !username) {
-        throw new ApiError(400, "Username or Password is required!");
+    // need (username OR email) AND password
+    if (!(username || email) || !password) {
+        throw new ApiError(400, "Username or email, and password are required!");
     }
 
-    User.findOne(
-        {
-            $or: [{ username }, { email }]
-        }
-    )
+    const user = await User.findOne({
+        $or: [
+            { username: username?.toLowerCase() },
+            { email: email?.toLowerCase() }
+        ]
+    })
 
     if (!user) {
         throw new ApiError(404, "User is not registered!")
     }
 
-    const isPasswordValid = await User.isPasswordCorrect(password)
+    const isPasswordValid = await user.isPasswordCorrect(password)
 
     if (!isPasswordValid) {
         throw new ApiError(401, "Invalid User Credentials !")
@@ -195,10 +198,10 @@ const logoutUser = asyncHandler(async (req, res) => {
 
 
 const refreshAccessToken = asyncHandler(async (req, res) => {
-    const incomingRefreshToken = req.cookies.refreshToken || req.body.refreshToken
+    const incomingRefreshToken = req.cookies?.refreshToken || req.body?.refreshToken
 
-    if (incomingRefreshToken) {
-        throw new ApiResponse(401, "Unauthorized access!")
+    if (!incomingRefreshToken) {
+        throw new ApiError(401, "Unauthorized access!")
     }
 
     try {
@@ -207,15 +210,14 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
             process.env.REFRESH_TOKEN_SECRET
         )
 
-        const user = User.findById(decodedToken?._id);
-
+        const user = await User.findById(decodedToken?._id);
 
         if (!user) {
             throw new ApiError(401, "Invalid refresh token!")
         }
 
         if (user.refreshToken !== incomingRefreshToken) {
-            throw new ApiError(401, "Refresh token is expired!")
+            throw new ApiError(401, "Refresh token is expired or used!")
         }
 
         const options = {
@@ -223,23 +225,21 @@ const refreshAccessToken = asyncHandler(async (req, res) => {
             secure: true
         }
 
-        const { newAccessToken, newRefreshToken } = await generateAccessAndRefreshToken(user._id)
+        const { accessToken, refreshToken } = await generateAccessAndRefreshToken(user._id)
+
         return res
             .status(200)
-            .cookie("accessToken", accessToken)
-            .cookie("refreshToken", refreshToken)
+            .cookie("accessToken", accessToken, options)
+            .cookie("refreshToken", refreshToken, options)
             .json(
                 new ApiResponse(
                     200,
-                    {
-                        accessToken: newAccessToken,
-                        refreshToken: newRefreshToken,
-                    },
+                    { accessToken, refreshToken },
                     "Access token refreshed!"
                 )
             )
     } catch (error) {
-        throw new ApiError(401, "Invalid refresh token !!")
+        throw new ApiError(401, error?.message || "Invalid refresh token !!")
     }
 })
 
@@ -403,7 +403,7 @@ const getUserChannelProfile = asyncHandler(async (req, res) => {
         },
         {
             $lookup: {
-                from: "subsciptions",
+                from: "subscriptions",
                 localField: "_id",
                 foreignField: "channel",
                 as: "subscribers"
@@ -411,23 +411,19 @@ const getUserChannelProfile = asyncHandler(async (req, res) => {
         },
         {
             $lookup: {
-                from: "subsciptions",
+                from: "subscriptions",
                 localField: "_id",
                 foreignField: "subscriber",
-                as: "subscibedTo"
+                as: "subscribedTo"
             }
         },
         {
             $addFields: {
-                subsciberCounts: {
-                    $size: "$subscriber"
-                },
-                channelsSubscribedToCount: {
-                    $size: "subscibedTo"
-                },
-                isSubscibed: {
-                    $cond: {//    this is the user  this is array of subsciber
-                        if: { $in: [req.user?._id, "$subscibers.subscriber"] }, // checking is req.user is subscirber ? by using $in on that subscibers.subscriber array
+                subscribersCount: { $size: "$subscribers" },
+                channelsSubscribedToCount: { $size: "$subscribedTo" },
+                isSubscribed: {
+                    $cond: {
+                        if: { $in: [req.user?._id, "$subscribers.subscriber"] },
                         then: true,
                         else: false
                     }
@@ -438,11 +434,11 @@ const getUserChannelProfile = asyncHandler(async (req, res) => {
             $project: {
                 fullName: 1,
                 username: 1,
-                subscriberCount: 1,
+                subscribersCount: 1,
                 channelsSubscribedToCount: 1,
+                isSubscribed: 1,
                 avatar: 1,
                 coverImage: 1,
-                isSubscribed: 1,
                 email: 1
             }
         }
@@ -450,7 +446,7 @@ const getUserChannelProfile = asyncHandler(async (req, res) => {
 
 
     if (!channel?.length) {
-        return new ApiError(404, "Channel Does Not Exists!")
+        throw new ApiError(404, "Channel Does Not Exists!")
     }
 
     return res
@@ -475,47 +471,46 @@ const getWatchHistory = asyncHandler(async (req, res) => {
         },
         {
             $lookup: {
-                from: "user",
+                from: "videos",
                 localField: "watchHistory",
                 foreignField: "_id",
                 as: "watchHistory",
-                pipeline: [{
-                    $lookup: {
-                        from: "users",
-                        localField: "owner",
-                        foreignField: "_id",
-                        as: "owner",
-                        pipeline: [
-                            {
-                                $project: {
-                                    fullName: 1,
-                                    username: 1,
-                                    avatar: 1
-                                }
-                            },
-                            {
-                                $addFields : {
-                                    owner : {
-                                        $first : "$owner"
+                pipeline: [
+                    {
+                        $lookup: {
+                            from: "users",
+                            localField: "owner",
+                            foreignField: "_id",
+                            as: "owner",
+                            pipeline: [
+                                {
+                                    $project: {
+                                        fullName: 1,
+                                        username: 1,
+                                        avatar: 1
                                     }
                                 }
-                            }
-                        ]
+                            ]
+                        }
+                    },
+                    {
+                        $addFields: {
+                            owner: { $first: "$owner" }
+                        }
                     }
-                }]
+                ]
             }
         }
     ])
 
     return res
-    .status(200)
-    .json(
-        new ApiResponse(200,
-            user[0].watchHistory,
-            "WatchHistory Fetched Successfully!"
+        .status(200)
+        .json(
+            new ApiResponse(200,
+                user[0]?.watchHistory || [],
+                "WatchHistory Fetched Successfully!"
+            )
         )
-    )
-
 })
 
 export {
